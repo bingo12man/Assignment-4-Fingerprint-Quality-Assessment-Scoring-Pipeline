@@ -96,79 +96,127 @@ def check_blur(
         "processed_shape": prepared_gray.shape,
     }
 
+def check_brightness(
+        image_bgr: np.ndarray,
+        dark_threshold: float = 50.0,
+        bright_threshold: float = 210.0,
+) -> dict:
 
-def save_laplacian_visualization(
-    image_bgr: np.ndarray,
-    output_path: str,
-) -> None:
-    
-    prepared_gray = prepare_for_blur_analysis(image_bgr)
+    if not isinstance(image_bgr, np.ndarray):
+        raise TypeError("The input image must be a NumPy array.")
 
-    laplacian = cv2.Laplacian(
-        prepared_gray,
-        cv2.CV_64F,
-    )
+    if image_bgr.ndim != 3 or image_bgr.shape[2] != 3:
+        raise ValueError("Expected a three-channel BGR image.")
 
-    absolute_edges = np.abs(laplacian)
-
-    visible_edges = cv2.normalize(
-        absolute_edges,
-        None,
-        alpha=0,
-        beta=255,
-        norm_type=cv2.NORM_MINMAX,
-    ).astype(np.uint8)
-
-    saved = cv2.imwrite(output_path, visible_edges)
-
-    if not saved:
-        raise IOError(
-            f"Could not save Laplacian visualization: {output_path}"
+    if dark_threshold >= bright_threshold:
+        raise ValueError(
+            "Dark threshold must be lower than bright threshold."
         )
 
-def create_synthetic_blur(
-    image_bgr: np.ndarray,
-    output_path: str,
-    kernel_size: int = 21,
-) -> None:
+    image_gray = convert_to_grayscale(image_bgr)
 
-    if kernel_size <= 0 or kernel_size % 2 == 0:
-        raise ValueError("Kernel size must be a positive odd number.")
+    brightness = float(image_gray.mean())
 
-    blurred_image = cv2.GaussianBlur(
-        image_bgr,
-        (kernel_size, kernel_size),
-        sigmaX=0,
+    dark_pixel_fraction = float(
+        np.mean(image_gray < dark_threshold)
     )
 
-    saved = cv2.imwrite(output_path, blurred_image)
+    bright_pixel_fraction = float(
+        np.mean(image_gray > bright_threshold)
+    )
 
-    if not saved:
-        raise IOError(f"Could not save blurry image: {output_path}")
+    too_dark = brightness < dark_threshold
+    too_bright = brightness > bright_threshold
+
+    return {
+        "brightness": round(brightness, 2),
+        "dark_threshold": float(dark_threshold),
+        "bright_threshold": float(bright_threshold),
+        "dark_pixel_fraction": round(dark_pixel_fraction, 4),
+        "bright_pixel_fraction": round(bright_pixel_fraction, 4),
+        "too_dark": bool(too_dark),
+        "too_bright": bool(too_bright),
+        "passed": bool(not too_dark and not too_bright),
+    }
+
+# def save_laplacian_visualization(
+#     image_bgr: np.ndarray,
+#     output_path: str,
+# ) -> None:
+    
+#     prepared_gray = prepare_for_blur_analysis(image_bgr)
+
+#     laplacian = cv2.Laplacian(
+#         prepared_gray,
+#         cv2.CV_64F,
+#     )
+
+#     absolute_edges = np.abs(laplacian)
+
+#     visible_edges = cv2.normalize(
+#         absolute_edges,
+#         None,
+#         alpha=0,
+#         beta=255,
+#         norm_type=cv2.NORM_MINMAX,
+#     ).astype(np.uint8)
+
+#     saved = cv2.imwrite(output_path, visible_edges)
+
+#     if not saved:
+#         raise IOError(
+#             f"Could not save Laplacian visualization: {output_path}"
+#         )
+
+# def create_synthetic_blur(
+#     image_bgr: np.ndarray,
+#     output_path: str,
+#     kernel_size: int = 21,
+# ) -> None:
+
+#     if kernel_size <= 0 or kernel_size % 2 == 0:
+#         raise ValueError("Kernel size must be a positive odd number.")
+
+#     blurred_image = cv2.GaussianBlur(
+#         image_bgr,
+#         (kernel_size, kernel_size),
+#         sigmaX=0,
+#     )
+
+#     saved = cv2.imwrite(output_path, blurred_image)
+
+#     if not saved:
+#         raise IOError(f"Could not save blurry image: {output_path}")
     
 def main() -> None:
-    """Compare blur scores after standardization and denoising."""
+    """Compare brightness across good and dark images."""
 
     test_cases = [
-        ("Original good image", "data/good/good_01.png"),
-        (
-            "Synthetic blurry image",
-            "data/blurry/synthetic_blurry_01.png",
-        ),
-        ("Real blurry image", "data/blurry/blurry_01.png"),
+        ("Good image", "data/good/good_01.png"),
+        ("Dark image", "data/dark/dark_01.png"),
     ]
 
     for label, image_path in test_cases:
         image_bgr = load_image(image_path)
-        result = check_blur(image_bgr)
+        result = check_brightness(image_bgr)
 
         print(f"\n{label}")
         print(f"Path: {image_path}")
-        print(f"Processed shape: {result['processed_shape']}")
-        print(f"Blur score: {result['blur_score']}")
-        print(f"Threshold: {result['threshold']}")
-        print(f"Is blurry: {result['is_blurry']}")
+        print(f"Brightness: {result['brightness']}")
+        print(f"Dark threshold: {result['dark_threshold']}")
+        print(f"Bright threshold: {result['bright_threshold']}")
+        print(f"Too dark: {result['too_dark']}")
+        print(f"Too bright: {result['too_bright']}")
+        print(f"Passed: {result['passed']}")
+        print(
+            f"Dark pixels: "
+            f"{result['dark_pixel_fraction'] * 100:.2f}%"
+        )
 
+        print(
+            f"Bright pixels: "
+            f"{result['bright_pixel_fraction'] * 100:.2f}%"
+        )
 
 if __name__ == "__main__":
     main()
