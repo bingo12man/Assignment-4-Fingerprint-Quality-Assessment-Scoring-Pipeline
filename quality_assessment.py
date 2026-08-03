@@ -5,6 +5,9 @@ import numpy as np
 # Provisional value. It will be recalibrated using the complete test set.
 DEFAULT_BLUR_THRESHOLD = 8.5
 
+DEFAULT_GLARE_PIXEL_THRESHOLD = 240
+DEFAULT_GLARE_FRACTION_THRESHOLD = 0.05
+
 def load_image(image_path: str) -> np.ndarray:
     path = Path(image_path)
 
@@ -139,6 +142,66 @@ def check_brightness(
         "passed": bool(not too_dark and not too_bright),
     }
 
+def check_glare(
+    image_bgr: np.ndarray,
+    pixel_threshold: int = DEFAULT_GLARE_PIXEL_THRESHOLD,
+    fraction_threshold: float = DEFAULT_GLARE_FRACTION_THRESHOLD,
+) -> dict:
+
+    if not isinstance(image_bgr, np.ndarray):
+        raise TypeError("The input image must be a NumPy array.")
+
+    if image_bgr.ndim != 3 or image_bgr.shape[2] != 3:
+        raise ValueError("Expected a three-channel BGR image.")
+
+    if not 0 <= pixel_threshold <= 255:
+        raise ValueError("Pixel threshold must be between 0 and 255.")
+
+    if not 0.0 <= fraction_threshold <= 1.0:
+        raise ValueError(
+            "Fraction threshold must be between 0.0 and 1.0."
+        )
+
+    image_gray = convert_to_grayscale(image_bgr)
+
+    glare_mask = image_gray > pixel_threshold
+
+    glare_pixel_count = int(np.count_nonzero(glare_mask))
+    total_pixel_count = int(glare_mask.size)
+
+    glare_fraction = glare_pixel_count / total_pixel_count
+    has_glare = glare_fraction > fraction_threshold
+
+    return {
+        "glare_fraction": round(float(glare_fraction), 4),
+        "glare_percentage": round(float(glare_fraction * 100), 2),
+        "glare_pixel_count": glare_pixel_count,
+        "total_pixel_count": total_pixel_count,
+        "maximum_intensity": int(image_gray.max()),
+        "pixel_threshold": int(pixel_threshold),
+        "fraction_threshold": float(fraction_threshold),
+        "has_glare": bool(has_glare),
+        "passed": bool(not has_glare),
+    }
+
+def save_glare_mask(
+    image_bgr: np.ndarray,
+    output_path: str,
+    pixel_threshold: int = DEFAULT_GLARE_PIXEL_THRESHOLD,
+) -> None:
+    """Save a binary image showing detected glare pixels."""
+
+    image_gray = convert_to_grayscale(image_bgr)
+
+    glare_mask = image_gray > pixel_threshold
+
+    visible_mask = glare_mask.astype(np.uint8) * 255
+
+    saved = cv2.imwrite(output_path, visible_mask)
+
+    if not saved:
+        raise IOError(f"Could not save glare mask: {output_path}")
+
 # def save_laplacian_visualization(
 #     image_bgr: np.ndarray,
 #     output_path: str,
@@ -189,34 +252,47 @@ def check_brightness(
 #         raise IOError(f"Could not save blurry image: {output_path}")
     
 def main() -> None:
-    """Compare brightness across good and dark images."""
+    """Compare glare levels in good and glare captures."""
+
+    Path("outputs").mkdir(exist_ok=True)
 
     test_cases = [
-        ("Good image", "data/good/good_01.png"),
-        ("Dark image", "data/dark/dark_01.png"),
+        (
+            "Good image",
+            "data/good/good_01.png",
+            "outputs/good_01_glare_mask.png",
+        ),
+        (
+            "Glare image",
+            "data/glare/glare_01.png",
+            "outputs/glare_01_mask.png",
+        ),
     ]
 
-    for label, image_path in test_cases:
+    for label, image_path, mask_path in test_cases:
         image_bgr = load_image(image_path)
-        result = check_brightness(image_bgr)
+
+        result = check_glare(image_bgr)
+
+        save_glare_mask(
+            image_bgr,
+            mask_path,
+        )
 
         print(f"\n{label}")
         print(f"Path: {image_path}")
-        print(f"Brightness: {result['brightness']}")
-        print(f"Dark threshold: {result['dark_threshold']}")
-        print(f"Bright threshold: {result['bright_threshold']}")
-        print(f"Too dark: {result['too_dark']}")
-        print(f"Too bright: {result['too_bright']}")
+        print(f"Maximum intensity: {result['maximum_intensity']}")
+        print(f"Glare pixels: {result['glare_pixel_count']}")
+        print(f"Total pixels: {result['total_pixel_count']}")
+        print(f"Glare percentage: {result['glare_percentage']}%")
+        print(
+            f"Allowed glare: "
+            f"{result['fraction_threshold'] * 100:.2f}%"
+        )
+        print(f"Has glare: {result['has_glare']}")
         print(f"Passed: {result['passed']}")
-        print(
-            f"Dark pixels: "
-            f"{result['dark_pixel_fraction'] * 100:.2f}%"
-        )
+        print(f"Mask saved to: {mask_path}")
 
-        print(
-            f"Bright pixels: "
-            f"{result['bright_pixel_fraction'] * 100:.2f}%"
-        )
 
 if __name__ == "__main__":
     main()
