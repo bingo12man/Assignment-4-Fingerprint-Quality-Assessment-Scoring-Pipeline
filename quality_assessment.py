@@ -10,6 +10,16 @@ DEFAULT_GLARE_FRACTION_THRESHOLD = 0.05
 
 DEFAULT_ROI_FRACTION_THRESHOLD = 0.15
 
+DEFAULT_GABOR_KERNEL_SIZE = 31
+DEFAULT_GABOR_SIGMA = 4.0
+DEFAULT_GABOR_WAVELENGTH = 10.0
+DEFAULT_GABOR_GAMMA = 0.5
+DEFAULT_GABOR_ORIENTATIONS = 6
+
+# Provisional threshold; recalibrate using the complete image dataset.
+DEFAULT_RIDGE_CLARITY_THRESHOLD = 1.5
+
+
 def load_image(image_path: str) -> np.ndarray:
     path = Path(image_path)
 
@@ -415,57 +425,675 @@ def check_roi_completeness(
         "unexpected_border_touch": bool(unexpected_border_touch),
     }
 
-def save_roi_visualizations(
+def extract_fingertip_patch(
     image_bgr: np.ndarray,
-    mask_path: str,
-    overlay_path: str,
-) -> None:
+    finger_mask: np.ndarray,
+    height_ratio: float = 0.35,
+    padding_ratio: float = 0.10,
+) -> tuple[np.ndarray, np.ndarray]:
 
-    finger_mask = create_finger_mask(image_bgr)
+    if image_bgr.ndim != 3 or image_bgr.shape[2] != 3:
+        raise ValueError("Expected a three-channel BGR image.")
 
-    if not cv2.imwrite(mask_path, finger_mask):
-        raise IOError(f"Could not save ROI mask: {mask_path}")
+    if finger_mask.ndim != 2:
+        raise ValueError("Expected a single-channel finger mask.")
 
-    overlay = image_bgr.copy()
+    if image_bgr.shape[:2] != finger_mask.shape:
+        raise ValueError(
+            "Image and finger mask must have matching dimensions."
+        )
+
+    if not 0.0 < height_ratio <= 1.0:
+        raise ValueError("Height ratio must be between 0 and 1.")
+
+    foreground_y, foreground_x = np.where(finger_mask > 0)
+
+    if foreground_x.size == 0:
+        raise ValueError("Finger mask contains no foreground pixels.")
+
+    top_y = int(foreground_y.min())
+    bottom_y = int(foreground_y.max())
+
+    finger_height = bottom_y - top_y + 1
+
+    patch_height = max(
+        1,
+        int(round(finger_height * height_ratio)),
+    )
+
+    patch_bottom = min(
+        finger_mask.shape[0],
+        top_y + patch_height,
+    )
+
+    top_region_mask = finger_mask[
+        top_y:patch_bottom,
+        :
+    ]
+
+    # Break narrow connections between the fingertip and shadows/background.
+    region_height, region_width = top_region_mask.shape
+
+    kernel_size = max(
+        3,
+        min(region_height, region_width) // 60,
+    )
+
+    # Morphological kernels should use odd dimensions.
+    if kernel_size % 2 == 0:
+        kernel_size += 1
+
+    separation_kernel = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE,
+        (kernel_size, kernel_size),
+    )
+
+    separated_mask = cv2.morphologyEx(
+        top_region_mask,
+        cv2.MORPH_OPEN,
+        separation_kernel,
+        iterations=2,
+    )
 
     contours, _ = cv2.findContours(
-        finger_mask,
+        separated_mask,
         cv2.RETR_EXTERNAL,
         cv2.CHAIN_APPROX_SIMPLE,
     )
 
-    if contours:
-        selected_contour = max(
-            contours,
-            key=cv2.contourArea,
+    if not contours:
+        raise ValueError(
+            "No foreground component found in the fingertip region."
         )
 
-        cv2.drawContours(
-            overlay,
-            [selected_contour],
-            contourIdx=-1,
-            color=(0, 255, 0),
-            thickness=8,
+    minimum_area = top_region_mask.size * 0.005
+
+    valid_contours = [
+        contour
+        for contour in contours
+        if cv2.contourArea(contour) >= minimum_area
+    ]
+
+    if not valid_contours:
+        raise ValueError(
+            "No sufficiently large fingertip component was found."
         )
 
-        x, y, width, height = cv2.boundingRect(
-            selected_contour
+    image_center_x = finger_mask.shape[1] / 2.0
+
+    def contour_score(contour: np.ndarray) -> float:
+        """
+        Prefer a large contour located near the horizontal centre.
+        """
+
+        area = cv2.contourArea(contour)
+
+        x, _, width, _ = cv2.boundingRect(contour)
+        contour_center_x = x + width / 2.0
+
+        normalized_distance = (
+            abs(contour_center_x - image_center_x)
+            / finger_mask.shape[1]
         )
 
-        cv2.rectangle(
-            overlay,
-            (x, y),
-            (x + width, y + height),
-            color=(255, 0, 0),
-            thickness=8,
+        return area / (1.0 + 4.0 * normalized_distance)
+
+    selected_contour = max(
+        valid_contours,
+        key=contour_score,
+    )
+
+    component_seed = np.zeros_like(top_region_mask)
+
+    cv2.drawContours(
+        component_seed,
+        [selected_contour],
+        contourIdx=-1,
+        color=255,
+        thickness=cv2.FILLED,
+    )
+
+    # Recover some area removed during opening.
+    recovered_component = cv2.dilate(
+        component_seed,
+        separation_kernel,
+        iterations=2,
+    )
+
+    # Keep only pixels that belonged to the original mask.
+    isolated_top_mask = cv2.bitwise_and(
+        recovered_component,
+        top_region_mask,
+    )
+
+    x, y, width, height = cv2.boundingRect(
+        selected_contour
+    )
+
+    padding_x = int(round(width * padding_ratio))
+    padding_y = int(round(height * padding_ratio))
+
+    left_x = max(0, x - padding_x)
+    right_x = min(
+        isolated_top_mask.shape[1],
+        x + width + padding_x,
+    )
+
+    upper_y = max(0, y - padding_y)
+    lower_y = min(
+        isolated_top_mask.shape[0],
+        y + height + padding_y,
+    )
+
+    image_gray = convert_to_grayscale(image_bgr)
+
+    top_region_gray = image_gray[
+        top_y:patch_bottom,
+        :
+    ]
+
+    fingertip_patch = top_region_gray[
+        upper_y:lower_y,
+        left_x:right_x,
+    ]
+
+    fingertip_mask = isolated_top_mask[
+        upper_y:lower_y,
+        left_x:right_x,
+    ]
+
+    return fingertip_patch, fingertip_mask
+
+def create_ridge_core_mask(
+    fingertip_mask: np.ndarray,
+    core_ratio: float = 0.35,
+) -> np.ndarray:
+
+    if fingertip_mask.ndim != 2:
+        raise ValueError(
+            "Expected a single-channel fingertip mask."
         )
 
-    if not cv2.imwrite(overlay_path, overlay):
-        raise IOError(f"Could not save ROI overlay: {overlay_path}")
+    if not 0.0 < core_ratio < 1.0:
+        raise ValueError(
+            "Core ratio must be between 0 and 1."
+        )
+
+    binary_mask = (
+        fingertip_mask > 0
+    ).astype(np.uint8)
+
+    if np.count_nonzero(binary_mask) == 0:
+        raise ValueError(
+            "Fingertip mask contains no foreground pixels."
+        )
+
+    distance_map = cv2.distanceTransform(
+        binary_mask,
+        cv2.DIST_L2,
+        maskSize=5,
+    )
+
+    _, maximum_distance, _, maximum_location = cv2.minMaxLoc(
+        distance_map
+    )
+
+    if maximum_distance <= 0:
+        raise ValueError(
+            "Could not calculate a valid fingertip distance map."
+        )
+
+    minimum_core_distance = (
+        maximum_distance * core_ratio
+    )
+
+    initial_core = (
+        distance_map >= minimum_core_distance
+    ).astype(np.uint8)
+
+    number_of_labels, labels, _, _ = (
+        cv2.connectedComponentsWithStats(
+            initial_core,
+            connectivity=8,
+        )
+    )
+
+    maximum_x, maximum_y = maximum_location
+    selected_label = labels[maximum_y, maximum_x]
+
+    if selected_label == 0 or number_of_labels <= 1:
+        raise ValueError(
+            "Could not isolate the central fingertip region."
+        )
+
+    core_mask = np.where(
+        labels == selected_label,
+        255,
+        0,
+    ).astype(np.uint8)
+
+    return core_mask
+
+def save_ridge_core(
+    image_bgr: np.ndarray,
+    output_path: str,
+) -> None:
+
+    finger_mask = create_finger_mask(image_bgr)
+
+    fingertip_patch, fingertip_mask = extract_fingertip_patch(
+        image_bgr,
+        finger_mask,
+    )
+
+    ridge_core_mask = create_ridge_core_mask(
+        fingertip_mask
+    )
+
+    visualization = np.full_like(
+        fingertip_patch,
+        fill_value=127,
+    )
+
+    visualization[ridge_core_mask > 0] = (
+        fingertip_patch[ridge_core_mask > 0]
+    )
+
+    if not cv2.imwrite(output_path, visualization):
+        raise IOError(
+            f"Could not save ridge-core image: {output_path}"
+        )
+    
+
+def save_fingertip_patch(
+    image_bgr: np.ndarray,
+    output_path: str,
+) -> None:
+
+    finger_mask = create_finger_mask(image_bgr)
+
+    fingertip_patch, fingertip_mask = extract_fingertip_patch(
+        image_bgr,
+        finger_mask,
+    )
+
+    masked_patch = np.full_like(
+        fingertip_patch,
+        fill_value=127,
+    )
+
+    masked_patch[fingertip_mask > 0] = (
+        fingertip_patch[fingertip_mask > 0]
+    )
+
+    if not cv2.imwrite(output_path, masked_patch):
+        raise IOError(
+            f"Could not save fingertip patch: {output_path}"
+        )
+
+def prepare_ridge_patch(
+    fingertip_patch: np.ndarray,
+    ridge_core_mask: np.ndarray,
+    max_dimension: int = 512,
+) -> tuple[np.ndarray, np.ndarray]:
+
+    if fingertip_patch.ndim != 2:
+        raise ValueError(
+            "Expected a single-channel fingertip patch."
+        )
+
+    if ridge_core_mask.ndim != 2:
+        raise ValueError(
+            "Expected a single-channel ridge-core mask."
+        )
+
+    if fingertip_patch.shape != ridge_core_mask.shape:
+        raise ValueError(
+            "Patch and ridge-core mask must have matching dimensions."
+        )
+
+    if max_dimension <= 0:
+        raise ValueError(
+            "Maximum dimension must be positive."
+        )
+
+    height, width = fingertip_patch.shape
+    largest_dimension = max(height, width)
+
+    if largest_dimension > max_dimension:
+        scale = max_dimension / largest_dimension
+
+        resized_width = max(
+            1,
+            int(round(width * scale)),
+        )
+        resized_height = max(
+            1,
+            int(round(height * scale)),
+        )
+
+        fingertip_patch = cv2.resize(
+            fingertip_patch,
+            (resized_width, resized_height),
+            interpolation=cv2.INTER_AREA,
+        )
+
+        ridge_core_mask = cv2.resize(
+            ridge_core_mask,
+            (resized_width, resized_height),
+            interpolation=cv2.INTER_NEAREST,
+        )
+
+    clahe = cv2.createCLAHE(
+        clipLimit=2.0,
+        tileGridSize=(8, 8),
+    )
+
+    enhanced_patch = clahe.apply(fingertip_patch)
+
+    ridge_core_mask = np.where(
+        ridge_core_mask > 0,
+        255,
+        0,
+    ).astype(np.uint8)
+
+    return enhanced_patch, ridge_core_mask
+
+def create_gabor_kernels(
+    kernel_size: int = DEFAULT_GABOR_KERNEL_SIZE,
+    sigma: float = DEFAULT_GABOR_SIGMA,
+    wavelength: float = DEFAULT_GABOR_WAVELENGTH,
+    gamma: float = DEFAULT_GABOR_GAMMA,
+    orientation_count: int = DEFAULT_GABOR_ORIENTATIONS,
+) -> list[np.ndarray]:
+
+    if kernel_size <= 0 or kernel_size % 2 == 0:
+        raise ValueError(
+            "Gabor kernel size must be a positive odd number."
+        )
+
+    if sigma <= 0 or wavelength <= 0 or gamma <= 0:
+        raise ValueError(
+            "Sigma, wavelength and gamma must be positive."
+        )
+
+    if orientation_count <= 0:
+        raise ValueError(
+            "Orientation count must be positive."
+        )
+
+    kernels = []
+
+    for orientation_index in range(orientation_count):
+        theta = (
+            orientation_index
+            * np.pi
+            / orientation_count
+        )
+
+        kernel = cv2.getGaborKernel(
+            ksize=(kernel_size, kernel_size),
+            sigma=sigma,
+            theta=theta,
+            lambd=wavelength,
+            gamma=gamma,
+            psi=0,
+            ktype=cv2.CV_32F,
+        )
+
+        # Remove the DC component so uniform brightness produces
+        # less response than periodic ridge texture.
+        kernel = kernel - kernel.mean()
+
+        kernel_norm = float(
+            np.sum(np.abs(kernel))
+        )
+
+        if kernel_norm > 0:
+            kernel = kernel / kernel_norm
+
+        kernels.append(kernel.astype(np.float32))
+
+    return kernels
+
+def calculate_gabor_response(
+    enhanced_patch: np.ndarray,
+    kernels: list[np.ndarray],
+) -> np.ndarray:
+
+    if enhanced_patch.ndim != 2:
+        raise ValueError(
+            "Expected a single-channel enhanced patch."
+        )
+
+    if not kernels:
+        raise ValueError(
+            "At least one Gabor kernel is required."
+        )
+
+    patch_float = enhanced_patch.astype(
+        np.float32
+    )
+
+    maximum_response = np.zeros(
+        enhanced_patch.shape,
+        dtype=np.float32,
+    )
+
+    for kernel in kernels:
+        response = cv2.filter2D(
+            patch_float,
+            ddepth=cv2.CV_32F,
+            kernel=kernel,
+            borderType=cv2.BORDER_REFLECT,
+        )
+
+        absolute_response = np.abs(response)
+
+        maximum_response = np.maximum(
+            maximum_response,
+            absolute_response,
+        )
+
+    return maximum_response
+
+def check_ridge_clarity(
+    image_bgr: np.ndarray,
+    threshold: float | None = DEFAULT_RIDGE_CLARITY_THRESHOLD,
+) -> dict:
+
+    finger_mask = create_finger_mask(image_bgr)
+
+    fingertip_patch, fingertip_mask = extract_fingertip_patch(
+        image_bgr,
+        finger_mask,
+    )
+
+    ridge_core_mask = create_ridge_core_mask(
+        fingertip_mask
+    )
+
+    enhanced_patch, ridge_core_mask = prepare_ridge_patch(
+        fingertip_patch,
+        ridge_core_mask,
+    )
+
+    kernels = create_gabor_kernels()
+
+    response_map = calculate_gabor_response(
+        enhanced_patch,
+        kernels,
+    )
+
+    # Remove mask-boundary pixels so the Gabor score measures
+    # interior ridges rather than the edge of the finger mask.
+    erosion_kernel = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE,
+        (9, 9),
+    )
+
+    interior_mask = cv2.erode(
+        ridge_core_mask,
+        erosion_kernel,
+        iterations=1,
+    )
+
+    if np.count_nonzero(interior_mask) == 0:
+        interior_mask = ridge_core_mask
+
+    valid_responses = response_map[
+        interior_mask > 0
+    ]
+
+    if valid_responses.size == 0:
+        raise ValueError(
+            "No valid ridge-response pixels were found."
+        )
+
+    ridge_score = float(
+        np.var(valid_responses)
+    )
+
+    mean_response = float(
+        np.mean(valid_responses)
+    )
+
+    passed = None
+
+    if threshold is not None:
+        if threshold < 0:
+            raise ValueError(
+                "Ridge threshold cannot be negative."
+            )
+
+        passed = ridge_score >= threshold
+
+    return {
+        "ridge_score": round(ridge_score, 4),
+        "mean_gabor_response": round(
+            mean_response,
+            4,
+        ),
+        "threshold": (
+            None
+            if threshold is None
+            else float(threshold)
+        ),
+        "passed": (
+            None
+            if passed is None
+            else bool(passed)
+        ),
+        "processed_shape": enhanced_patch.shape,
+        "orientation_count": len(kernels),
+        "response_map": response_map,
+        "analysis_mask": interior_mask,
+    }
+
+def save_gabor_response(
+    result: dict,
+    output_path: str,
+) -> None:
+
+    response_map = result["response_map"]
+    analysis_mask = result["analysis_mask"]
+
+    visible_response = np.zeros(
+        response_map.shape,
+        dtype=np.uint8,
+    )
+
+    valid_values = response_map[
+        analysis_mask > 0
+    ]
+
+    if valid_values.size == 0:
+        raise ValueError(
+            "No valid Gabor responses are available."
+        )
+
+    minimum_value = float(valid_values.min())
+    maximum_value = float(valid_values.max())
+
+    if maximum_value > minimum_value:
+        normalized = (
+            (response_map - minimum_value)
+            / (maximum_value - minimum_value)
+            * 255.0
+        )
+
+        normalized = np.clip(
+            normalized,
+            0,
+            255,
+        ).astype(np.uint8)
+
+        visible_response[
+            analysis_mask > 0
+        ] = normalized[
+            analysis_mask > 0
+        ]
+
+    if not cv2.imwrite(
+        output_path,
+        visible_response,
+    ):
+        raise IOError(
+            f"Could not save Gabor response: {output_path}"
+        )
+
+    
+# def save_roi_visualizations(
+#     image_bgr: np.ndarray,
+#     mask_path: str,
+#     overlay_path: str,
+# ) -> None:
+
+#     finger_mask = create_finger_mask(image_bgr)
+
+#     if not cv2.imwrite(mask_path, finger_mask):
+#         raise IOError(f"Could not save ROI mask: {mask_path}")
+
+#     overlay = image_bgr.copy()
+
+#     contours, _ = cv2.findContours(
+#         finger_mask,
+#         cv2.RETR_EXTERNAL,
+#         cv2.CHAIN_APPROX_SIMPLE,
+#     )
+
+#     if contours:
+#         selected_contour = max(
+#             contours,
+#             key=cv2.contourArea,
+#         )
+
+#         cv2.drawContours(
+#             overlay,
+#             [selected_contour],
+#             contourIdx=-1,
+#             color=(0, 255, 0),
+#             thickness=8,
+#         )
+
+#         x, y, width, height = cv2.boundingRect(
+#             selected_contour
+#         )
+
+#         cv2.rectangle(
+#             overlay,
+#             (x, y),
+#             (x + width, y + height),
+#             color=(255, 0, 0),
+#             thickness=8,
+#         )
+
+#     if not cv2.imwrite(overlay_path, overlay):
+#         raise IOError(f"Could not save ROI overlay: {overlay_path}")
 
     
 def main() -> None:
-    """Compare ROI completeness for normal and distant captures."""
+    """Compare Gabor ridge clarity using a controlled blur test."""
 
     Path("outputs").mkdir(exist_ok=True)
 
@@ -473,41 +1101,51 @@ def main() -> None:
         (
             "Good image",
             "data/good/good_01.png",
-            "outputs/good_01_roi_mask.png",
-            "outputs/good_01_roi_overlay.png",
+            "outputs/good_01_gabor_response.png",
         ),
         (
-            "Finger too small",
-            "data/roi/too_small_01.png",
-            "outputs/too_small_01_roi_mask.png",
-            "outputs/too_small_01_roi_overlay.png",
+            "Synthetic blurry image",
+            "data/blurry/synthetic_blurry_01.png",
+            "outputs/synthetic_blurry_01_gabor_response.png",
+        ),
+        (
+            "Real blurry image",
+            "data/blurry/blurry_01.png",
+            "outputs/blurry_01_gabor_response.png",
         ),
     ]
 
-    for label, image_path, mask_path, overlay_path in test_cases:
+    for label, image_path, response_path in test_cases:
         image_bgr = load_image(image_path)
 
-        result = check_roi_completeness(image_bgr)
+        result = check_ridge_clarity(image_bgr)
 
-        save_roi_visualizations(
-            image_bgr,
-            mask_path,
-            overlay_path,
+        save_gabor_response(
+            result,
+            response_path,
         )
 
         print(f"\n{label}")
         print(f"Path: {image_path}")
-        print(f"ROI percentage: {result['roi_percentage']}%")
-        print(f"Required percentage: {result['threshold'] * 100:.2f}%")
-        print(f"ROI complete: {result['roi_complete']}")
-        print(f"Bounding box: {result['bounding_box']}")
-        print(f"Mask: {mask_path}")
-        print(f"Overlay: {overlay_path}")
-        print(f"Border contact: {result['border_contact']}")
+        # print(
+        #     f"Processed shape: "
+        #     f"{result['processed_shape']}"
+        # )
+        # print(
+        #     f"Orientations: "
+        #     f"{result['orientation_count']}"
+        # )
+        # print(
+        #     f"Mean Gabor response: "
+        #     f"{result['mean_gabor_response']}"
+        # )
         print(
-            f"Unexpected border touch: "
-            f"{result['unexpected_border_touch']}"
+            f"Ridge clarity score: "
+            f"{result['ridge_score']}"
         )
+        # print(f"Saved to: {response_path}")
+        print(f"Threshold: {result['threshold']}")
+        print(f"Passed: {result['passed']}")
 
 if __name__ == "__main__":
     main()
