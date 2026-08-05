@@ -5,7 +5,9 @@ __pycache__/
 .DS_Store
 # Personal biometric test images and generated outputs
 data/
-outputs/
 
 # Local editor configuration
 .vscode/
+
+!outputs/
+!outputs/**
