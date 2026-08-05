@@ -4,11 +4,26 @@ import numpy as np
 
 from time import perf_counter
 
-# Provisional value. It will be recalibrated using the complete test set.
-DEFAULT_BLUR_THRESHOLD = 8.5
+# Calibrated using the 20-image assignment evaluation dataset.
+DEFAULT_BLUR_THRESHOLD = 300.0
+
+# Scores below this indicate severe, consistent blur.
+DEFAULT_SEVERE_BLUR_THRESHOLD = 70.0
+
+# A larger spread can indicate that the finger occupies
+# only part of the central analysis region.
+DEFAULT_BLUR_SPREAD_THRESHOLD = 80.0
 
 DEFAULT_GLARE_PIXEL_THRESHOLD = 240
-DEFAULT_GLARE_FRACTION_THRESHOLD = 0.05
+
+# Calibrated global glare threshold.
+DEFAULT_GLARE_FRACTION_THRESHOLD = 0.009
+
+DEFAULT_GLARE_SATURATION_THRESHOLD = 80
+
+# Calibrated localized glare thresholds.
+DEFAULT_ROI_GLARE_FRACTION_THRESHOLD = 0.007
+DEFAULT_GLARE_HOTSPOT_FRACTION_THRESHOLD = 0.0045
 
 DEFAULT_ROI_FRACTION_THRESHOLD = 0.15
 
@@ -18,8 +33,7 @@ DEFAULT_GABOR_WAVELENGTH = 10.0
 DEFAULT_GABOR_GAMMA = 0.5
 DEFAULT_GABOR_ORIENTATIONS = 6
 
-# Provisional threshold; recalibrate using the complete image dataset.
-DEFAULT_RIDGE_CLARITY_THRESHOLD = 1.5
+DEFAULT_RIDGE_CLARITY_THRESHOLD = 1.0
 
 DEFAULT_QUALITY_WEIGHTS = {
     "blur": 0.25,
@@ -105,74 +119,302 @@ def convert_to_grayscale(image_bgr: np.ndarray) -> np.ndarray:
 
     return grayscale
 
-def prepare_for_blur_analysis(
+def prepare_center_blur_regions(
     image_bgr: np.ndarray,
-    max_dimension: int = 1024,
-) -> np.ndarray:
+    strip_width_ratio: float = 0.18,
+    vertical_start_ratio: float = 0.18,
+    vertical_end_ratio: float = 0.82,
+    strip_centers: tuple[float, ...] = (
+        0.45,
+        0.50,
+        0.55,
+    ),
+) -> list[np.ndarray]:
+    """
+    Extract overlapping central regions for blur analysis.
+
+    The capture process expects the finger to appear near the
+    horizontal centre of the image. Using multiple overlapping
+    strips reduces the influence of an isolated background edge.
+    """
 
     if not isinstance(image_bgr, np.ndarray):
-        raise TypeError("The input image must be a NumPy array.")
-
-    if image_bgr.ndim != 3 or image_bgr.shape[2] != 3:
-        raise ValueError("Expected a three-channel BGR image.")
-
-    if max_dimension <= 0:
-        raise ValueError("Maximum dimension must be positive.")
-
-    height, width = image_bgr.shape[:2]
-    largest_dimension = max(height, width)
-
-    if largest_dimension > max_dimension:
-        scale = max_dimension / largest_dimension
-
-        resized_width = int(round(width * scale))
-        resized_height = int(round(height * scale))
-
-        image_bgr = cv2.resize(
-            image_bgr,
-            (resized_width, resized_height),
-            interpolation=cv2.INTER_AREA,
+        raise TypeError(
+            "The input image must be a NumPy array."
         )
 
-    image_gray = convert_to_grayscale(image_bgr)
+    if image_bgr.ndim != 3 or image_bgr.shape[2] != 3:
+        raise ValueError(
+            "Expected a three-channel BGR image."
+        )
 
-    denoised_gray = cv2.medianBlur(
-        image_gray,
-        3,
+    if not 0.0 < strip_width_ratio <= 1.0:
+        raise ValueError(
+            "Strip width ratio must be between 0 and 1."
+        )
+
+    if not (
+        0.0
+        <= vertical_start_ratio
+        < vertical_end_ratio
+        <= 1.0
+    ):
+        raise ValueError(
+            "Vertical ratios must satisfy "
+            "0 <= start < end <= 1."
+        )
+
+    if not strip_centers:
+        raise ValueError(
+            "At least one strip centre is required."
+        )
+
+    analysis_image = resize_for_quality_analysis(
+        image_bgr
     )
 
-    return denoised_gray
+    gray_image = convert_to_grayscale(
+        analysis_image
+    )
+
+    image_height, image_width = gray_image.shape
+
+    y_start = int(
+        round(
+            vertical_start_ratio
+            * image_height
+        )
+    )
+
+    y_end = int(
+        round(
+            vertical_end_ratio
+            * image_height
+        )
+    )
+
+    strip_width = max(
+        16,
+        int(
+            round(
+                strip_width_ratio
+                * image_width
+            )
+        ),
+    )
+
+    regions = []
+
+    for center_ratio in strip_centers:
+        if not 0.0 < center_ratio < 1.0:
+            raise ValueError(
+                "Every strip centre must be between 0 and 1."
+            )
+
+        center_x = int(
+            round(
+                center_ratio
+                * image_width
+            )
+        )
+
+        x_start = max(
+            0,
+            center_x - strip_width // 2,
+        )
+
+        x_end = min(
+            image_width,
+            x_start + strip_width,
+        )
+
+        x_start = max(
+            0,
+            x_end - strip_width,
+        )
+
+        region = gray_image[
+            y_start:y_end,
+            x_start:x_end,
+        ]
+
+        if region.size == 0:
+            raise ValueError(
+                "A blur-analysis region was empty."
+            )
+
+        # Reduce sensor noise so noise is not counted as sharp detail.
+        processed_region = cv2.medianBlur(
+            region,
+            5,
+        )
+
+        regions.append(
+            processed_region
+        )
+
+    return regions
 
 
 def check_blur(
     image_bgr: np.ndarray,
     threshold: float = DEFAULT_BLUR_THRESHOLD,
-    max_dimension: int = 1024,
+    severe_threshold: float = DEFAULT_SEVERE_BLUR_THRESHOLD,
+    spread_threshold: float = DEFAULT_BLUR_SPREAD_THRESHOLD,
 ) -> dict:
+    """
+    Measure blur using the median Laplacian variance from
+    overlapping central image regions.
 
-    prepared_gray = prepare_for_blur_analysis(
-        image_bgr,
-        max_dimension=max_dimension,
+    Higher scores indicate stronger visible image detail.
+    """
+
+    if not isinstance(image_bgr, np.ndarray):
+        raise TypeError(
+            "The input image must be a NumPy array."
+        )
+
+    if image_bgr.ndim != 3 or image_bgr.shape[2] != 3:
+        raise ValueError(
+            "Expected a three-channel BGR image."
+        )
+
+    if threshold < 0:
+        raise ValueError(
+            "Blur threshold cannot be negative."
+        )
+    if severe_threshold < 0:
+        raise ValueError(
+            "Severe blur threshold cannot be negative."
+        )
+
+    if severe_threshold >= threshold:
+        raise ValueError(
+            "Severe blur threshold must be lower "
+            "than the main blur threshold."
+        )
+
+    if spread_threshold < 0:
+        raise ValueError(
+            "Blur spread threshold cannot be negative."
+        )
+    analysis_regions = prepare_center_blur_regions(
+        image_bgr
     )
 
-    laplacian = cv2.Laplacian(
-        prepared_gray,
-        cv2.CV_64F,
+    strip_scores = []
+
+    for region in analysis_regions:
+        laplacian = cv2.Laplacian(
+            region,
+            cv2.CV_64F,
+            ksize=3,
+        )
+
+        strip_score = float(
+            np.var(laplacian)
+        )
+
+        strip_scores.append(
+            strip_score
+        )
+
+    blur_score = float(
+        np.median(strip_scores)
     )
 
-    blur_score = float(laplacian.var())
-    is_blurry = blur_score < threshold
+    minimum_strip_score = float(
+        np.min(strip_scores)
+    )
+
+    maximum_strip_score = float(
+        np.max(strip_scores)
+    )
+
+    strip_score_spread = (
+        maximum_strip_score
+        - minimum_strip_score
+    )
+
+    # Normal case: the median central-strip score is sharp.
+    median_score_passed = (
+        blur_score >= threshold
+    )
+
+    # Different capture framing may place the finger in only
+    # part of the central region. In that situation, acceptable
+    # images have noticeable variation between strips.
+    #
+    # Requiring maximum_strip_score < threshold prevents one
+    # extremely sharp background object from making a blurry
+    # capture appear acceptable.
+    partial_finger_passed = (
+        blur_score >= severe_threshold
+        and maximum_strip_score < threshold
+        and strip_score_spread > spread_threshold
+    )
+
+    passed = (
+        median_score_passed
+        or partial_finger_passed
+    )
+
+    is_blurry = not passed
 
     return {
-        "blur_score": round(blur_score, 2),
-        "threshold": float(threshold),
-        "is_blurry": bool(is_blurry),
-        "processed_shape": prepared_gray.shape,
+        "blur_score": round(
+            blur_score,
+            4,
+        ),
+        "threshold": float(
+            threshold
+        ),
+        "severe_threshold": float(
+            severe_threshold
+        ),
+        "spread_threshold": float(
+            spread_threshold
+        ),
+        "minimum_strip_score": round(
+            minimum_strip_score,
+            4,
+        ),
+        "maximum_strip_score": round(
+            maximum_strip_score,
+            4,
+        ),
+        "strip_score_spread": round(
+            strip_score_spread,
+            4,
+        ),
+        "median_score_passed": bool(
+            median_score_passed
+        ),
+        "partial_finger_passed": bool(
+            partial_finger_passed
+        ),
+        "is_blurry": bool(
+            is_blurry
+        ),
+        "passed": bool(
+            passed
+        ),
+        "strip_scores": [
+            round(score, 4)
+            for score in strip_scores
+        ],
+        "region_count": len(
+            analysis_regions
+        ),
+        "processed_shapes": [
+            region.shape
+            for region in analysis_regions
+        ],
     }
 
 def check_brightness(
     image_bgr: np.ndarray,
-    dark_threshold: float = 50.0,
+    dark_threshold: float = 80.0,
     bright_threshold: float = 210.0,
     finger_mask: np.ndarray | None = None,
 ) -> dict:
@@ -261,40 +503,244 @@ def check_glare(
     image_bgr: np.ndarray,
     pixel_threshold: int = DEFAULT_GLARE_PIXEL_THRESHOLD,
     fraction_threshold: float = DEFAULT_GLARE_FRACTION_THRESHOLD,
+    saturation_threshold: int = (
+        DEFAULT_GLARE_SATURATION_THRESHOLD
+    ),
+    roi_fraction_threshold: float = (
+        DEFAULT_ROI_GLARE_FRACTION_THRESHOLD
+    ),
+    hotspot_fraction_threshold: float = (
+        DEFAULT_GLARE_HOTSPOT_FRACTION_THRESHOLD
+    ),
+    finger_mask: np.ndarray | None = None,
 ) -> dict:
 
     if not isinstance(image_bgr, np.ndarray):
-        raise TypeError("The input image must be a NumPy array.")
-
-    if image_bgr.ndim != 3 or image_bgr.shape[2] != 3:
-        raise ValueError("Expected a three-channel BGR image.")
-
-    if not 0 <= pixel_threshold <= 255:
-        raise ValueError("Pixel threshold must be between 0 and 255.")
-
-    if not 0.0 <= fraction_threshold <= 1.0:
-        raise ValueError(
-            "Fraction threshold must be between 0.0 and 1.0."
+        raise TypeError(
+            "The input image must be a NumPy array."
         )
 
-    image_gray = convert_to_grayscale(image_bgr)
+    if image_bgr.ndim != 3 or image_bgr.shape[2] != 3:
+        raise ValueError(
+            "Expected a three-channel BGR image."
+        )
 
-    glare_mask = image_gray > pixel_threshold
+    if not 0 <= pixel_threshold <= 255:
+        raise ValueError(
+            "Pixel threshold must be between 0 and 255."
+        )
 
-    glare_pixel_count = int(np.count_nonzero(glare_mask))
-    total_pixel_count = int(glare_mask.size)
+    if not 0 <= saturation_threshold <= 255:
+        raise ValueError(
+            "Saturation threshold must be between 0 and 255."
+        )
 
-    glare_fraction = glare_pixel_count / total_pixel_count
-    has_glare = glare_fraction > fraction_threshold
+    for threshold_name, threshold_value in (
+        ("fraction threshold", fraction_threshold),
+        ("ROI fraction threshold", roi_fraction_threshold),
+        (
+            "hotspot fraction threshold",
+            hotspot_fraction_threshold,
+        ),
+    ):
+        if not 0.0 <= threshold_value <= 1.0:
+            raise ValueError(
+                f"{threshold_name} must be between 0 and 1."
+            )
+
+    image_gray = convert_to_grayscale(
+        image_bgr
+    )
+
+    hsv_image = cv2.cvtColor(
+        image_bgr,
+        cv2.COLOR_BGR2HSV,
+    )
+
+    saturation_channel = hsv_image[
+        :,
+        :,
+        1,
+    ]
+
+    # Specular glare is usually very bright and close to white,
+    # meaning high intensity but relatively low saturation.
+    bright_mask = image_gray > pixel_threshold
+    low_saturation_mask = (
+        saturation_channel
+        <= saturation_threshold
+    )
+
+    glare_mask = np.logical_and(
+        bright_mask,
+        low_saturation_mask,
+    ).astype(np.uint8) * 255
+
+    glare_pixel_count = int(
+        np.count_nonzero(glare_mask)
+    )
+
+    total_pixel_count = int(
+        glare_mask.size
+    )
+
+    glare_fraction = (
+        glare_pixel_count
+        / total_pixel_count
+    )
+
+    if finger_mask is None:
+        finger_mask = create_finger_mask(
+            image_bgr
+        )
+
+    if finger_mask.ndim != 2:
+        raise ValueError(
+            "Expected a single-channel finger mask."
+        )
+
+    if finger_mask.shape != image_gray.shape:
+        raise ValueError(
+            "Finger mask and image must have matching dimensions."
+        )
+
+    finger_pixels = finger_mask > 0
+    roi_pixel_count = int(
+        np.count_nonzero(finger_pixels)
+    )
+
+    if roi_pixel_count == 0:
+        raise ValueError(
+            "No finger pixels were available for glare analysis."
+        )
+
+    roi_glare_mask = cv2.bitwise_and(
+        glare_mask,
+        finger_mask,
+    )
+
+    roi_glare_pixel_count = int(
+        np.count_nonzero(roi_glare_mask)
+    )
+
+    roi_glare_fraction = (
+        roi_glare_pixel_count
+        / roi_pixel_count
+    )
+
+    # Remove isolated one-pixel noise before hotspot analysis.
+    cleanup_kernel = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE,
+        (3, 3),
+    )
+
+    cleaned_roi_glare_mask = cv2.morphologyEx(
+        roi_glare_mask,
+        cv2.MORPH_OPEN,
+        cleanup_kernel,
+        iterations=1,
+    )
+
+    number_of_labels, _, statistics, _ = (
+        cv2.connectedComponentsWithStats(
+            cleaned_roi_glare_mask,
+            connectivity=8,
+        )
+    )
+
+    largest_hotspot_pixels = 0
+
+    # Label zero represents the background.
+    if number_of_labels > 1:
+        component_areas = statistics[
+            1:,
+            cv2.CC_STAT_AREA,
+        ]
+
+        largest_hotspot_pixels = int(
+            component_areas.max()
+        )
+
+    largest_hotspot_fraction = (
+        largest_hotspot_pixels
+        / roi_pixel_count
+    )
+
+    global_glare_detected = (
+        glare_fraction
+        > fraction_threshold
+    )
+
+    localized_glare_detected = (
+        roi_glare_fraction
+        > roi_fraction_threshold
+        and largest_hotspot_fraction
+        > hotspot_fraction_threshold
+    )
+
+    has_glare = (
+        global_glare_detected
+        or localized_glare_detected
+    )
 
     return {
-        "glare_fraction": round(float(glare_fraction), 4),
-        "glare_percentage": round(float(glare_fraction * 100), 2),
+        "glare_fraction": round(
+            float(glare_fraction),
+            4,
+        ),
+        "glare_percentage": round(
+            float(glare_fraction * 100),
+            2,
+        ),
         "glare_pixel_count": glare_pixel_count,
         "total_pixel_count": total_pixel_count,
-        "maximum_intensity": int(image_gray.max()),
-        "pixel_threshold": int(pixel_threshold),
-        "fraction_threshold": float(fraction_threshold),
+
+        "roi_glare_fraction": round(
+            float(roi_glare_fraction),
+            4,
+        ),
+        "roi_glare_percentage": round(
+            float(roi_glare_fraction * 100),
+            2,
+        ),
+        "roi_glare_pixel_count": (
+            roi_glare_pixel_count
+        ),
+        "roi_pixel_count": roi_pixel_count,
+
+        "largest_hotspot_pixels": (
+            largest_hotspot_pixels
+        ),
+        "largest_hotspot_fraction": round(
+            float(largest_hotspot_fraction),
+            4,
+        ),
+
+        "maximum_intensity": int(
+            image_gray.max()
+        ),
+        "pixel_threshold": int(
+            pixel_threshold
+        ),
+        "saturation_threshold": int(
+            saturation_threshold
+        ),
+        "fraction_threshold": float(
+            fraction_threshold
+        ),
+        "roi_fraction_threshold": float(
+            roi_fraction_threshold
+        ),
+        "hotspot_fraction_threshold": float(
+            hotspot_fraction_threshold
+        ),
+
+        "global_glare_detected": bool(
+            global_glare_detected
+        ),
+        "localized_glare_detected": bool(
+            localized_glare_detected
+        ),
         "has_glare": bool(has_glare),
         "passed": bool(not has_glare),
     }
@@ -1507,17 +1953,23 @@ def quality_gate(
         original_image_bgr
     )
 
-    finger_mask = create_finger_mask(image_bgr)
+    finger_mask = create_finger_mask(
+        image_bgr
+    )
 
-    blur_result = check_blur(image_bgr)
+    blur_result = check_blur(
+        image_bgr
+    )
 
     brightness_result = check_brightness(
         image_bgr,
         finger_mask=finger_mask,
     )
 
-    glare_result = check_glare(image_bgr)
-
+    glare_result = check_glare(
+        image_bgr,
+        finger_mask=finger_mask,
+    )
     roi_result = check_roi_completeness(
         image_bgr,
         finger_mask=finger_mask,
@@ -1807,69 +2259,35 @@ def profile_quality_stages(
 
 
 def main() -> None:
-    """Validate the optimized pipeline on all test conditions."""
+    """Run a simple quality-gate smoke test."""
 
-    test_cases = [
-        ("Good", "data/good/good_01.png"),
-        (
-            "Synthetic blurry",
-            "data/blurry/synthetic_blurry_01.png",
-        ),
-        (
-            "Real blurry",
-            "data/blurry/blurry_01.png",
-        ),
-        ("Dark", "data/dark/dark_01.png"),
-        ("Glare", "data/glare/glare_01.png"),
-        (
-            "Too small",
-            "data/roi/too_small_01.png",
-        ),
-    ]
+    image_path = "data/good/good_01.png"
 
-    for label, image_path in test_cases:
-        print("\n" + "=" * 55)
-        print(f"Test case: {label}")
-        print(f"Image: {image_path}")
+    result = quality_gate(
+        image_path
+    )
 
-        if not Path(image_path).exists():
-            print("Skipped: file does not exist.")
-            continue
-
-        try:
-            result = quality_gate(image_path)
-
-        except (ValueError, IOError) as error:
-            print(f"Pipeline error: {error}")
-            continue
-
-        print(
-            f"Original shape: "
-            f"{result['original_shape']}"
-        )
-        print(
-            f"Analysis shape: "
-            f"{result['analysis_shape']}"
-        )
-        print(
-            f"Raw weighted score: "
-            f"{result['raw_composite_score']}"
-        )
-        print(
-            f"Final composite score: "
-            f"{result['composite_score']}"
-        )
-
-        print("Individual checks:")
-
-        for metric_name in METRIC_ORDER:
-            print(
-                f"  {metric_name}: "
-                f"{result['individual_checks'][metric_name]}"
-            )
-
-        print(f"Final decision: {result['passed']}")
-        print(f"Guidance: {result['guidance']}")
+    print(f"Image: {image_path}")
+    print(
+        f"Blur score: "
+        f"{result['blur']['blur_score']}"
+    )
+    print(
+        f"Blur strip scores: "
+        f"{result['blur']['strip_scores']}"
+    )
+    print(
+        f"Composite score: "
+        f"{result['composite_score']}"
+    )
+    print(
+        f"Final decision: "
+        f"{result['passed']}"
+    )
+    print(
+        f"Guidance: "
+        f"{result['guidance']}"
+    )
 
 
 if __name__ == "__main__":
