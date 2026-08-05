@@ -1945,6 +1945,23 @@ def generate_quality_guidance(
 
 def quality_gate(
     image_path: str,
+    blur_threshold: float = DEFAULT_BLUR_THRESHOLD,
+    severe_blur_threshold: float = DEFAULT_SEVERE_BLUR_THRESHOLD,
+    blur_spread_threshold: float = DEFAULT_BLUR_SPREAD_THRESHOLD,
+    dark_threshold: float = 80.0,
+    bright_threshold: float = 210.0,
+    glare_pixel_threshold: int = DEFAULT_GLARE_PIXEL_THRESHOLD,
+    glare_fraction_threshold: float = DEFAULT_GLARE_FRACTION_THRESHOLD,
+    glare_saturation_threshold: int = DEFAULT_GLARE_SATURATION_THRESHOLD,
+    roi_glare_fraction_threshold: float = (
+        DEFAULT_ROI_GLARE_FRACTION_THRESHOLD
+    ),
+    glare_hotspot_fraction_threshold: float = (
+        DEFAULT_GLARE_HOTSPOT_FRACTION_THRESHOLD
+    ),
+    roi_fraction_threshold: float = DEFAULT_ROI_FRACTION_THRESHOLD,
+    ridge_threshold: float = DEFAULT_RIDGE_CLARITY_THRESHOLD,
+    composite_threshold: float = DEFAULT_COMPOSITE_THRESHOLD,
 ) -> dict:
     
     original_image_bgr = load_image(image_path)
@@ -1958,25 +1975,38 @@ def quality_gate(
     )
 
     blur_result = check_blur(
-        image_bgr
+        image_bgr,
+        threshold=blur_threshold,
+        severe_threshold=severe_blur_threshold,
+        spread_threshold=blur_spread_threshold,
     )
 
     brightness_result = check_brightness(
         image_bgr,
+        dark_threshold=dark_threshold,
+        bright_threshold=bright_threshold,
         finger_mask=finger_mask,
     )
 
     glare_result = check_glare(
         image_bgr,
+        pixel_threshold=glare_pixel_threshold,
+        fraction_threshold=glare_fraction_threshold,
+        saturation_threshold=glare_saturation_threshold,
+        roi_fraction_threshold=roi_glare_fraction_threshold,
+        hotspot_fraction_threshold=glare_hotspot_fraction_threshold,
         finger_mask=finger_mask,
     )
+
     roi_result = check_roi_completeness(
         image_bgr,
+        threshold=roi_fraction_threshold,
         finger_mask=finger_mask,
     )
 
     ridge_result = check_ridge_clarity(
         image_bgr,
+        threshold=ridge_threshold,
         finger_mask=finger_mask,
     )
 
@@ -1989,7 +2019,8 @@ def quality_gate(
     )
 
     composite_result = calculate_composite_score(
-        normalized_metrics
+        normalized_metrics,
+        pass_threshold=composite_threshold,
     )
 
     guidance, issues = generate_quality_guidance(
