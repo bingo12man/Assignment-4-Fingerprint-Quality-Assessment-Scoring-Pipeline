@@ -130,46 +130,90 @@ def check_blur(
     }
 
 def check_brightness(
-        image_bgr: np.ndarray,
-        dark_threshold: float = 50.0,
-        bright_threshold: float = 210.0,
+    image_bgr: np.ndarray,
+    dark_threshold: float = 50.0,
+    bright_threshold: float = 210.0,
+    finger_mask: np.ndarray | None = None,
 ) -> dict:
 
-    if not isinstance(image_bgr, np.ndarray):
-        raise TypeError("The input image must be a NumPy array.")
-
     if image_bgr.ndim != 3 or image_bgr.shape[2] != 3:
-        raise ValueError("Expected a three-channel BGR image.")
+        raise ValueError(
+            "Expected a three-channel BGR image."
+        )
+
+    if dark_threshold < 0 or bright_threshold > 255:
+        raise ValueError(
+            "Brightness thresholds must be between 0 and 255."
+        )
 
     if dark_threshold >= bright_threshold:
         raise ValueError(
             "Dark threshold must be lower than bright threshold."
         )
 
-    image_gray = convert_to_grayscale(image_bgr)
+    gray_image = convert_to_grayscale(image_bgr)
 
-    brightness = float(image_gray.mean())
+    global_brightness = float(
+        np.mean(gray_image)
+    )
+
+    if finger_mask is None:
+        finger_mask = create_finger_mask(image_bgr)
+
+    if finger_mask.ndim != 2:
+        raise ValueError(
+            "Expected a single-channel finger mask."
+        )
+
+    if finger_mask.shape != gray_image.shape:
+        raise ValueError(
+            "Finger mask and image must have matching dimensions."
+        )
+
+    roi_pixels = gray_image[finger_mask > 0]
+
+    if roi_pixels.size == 0:
+        raise ValueError(
+            "No finger pixels were available for brightness analysis."
+        )
+
+    brightness = float(
+        np.mean(roi_pixels)
+    )
 
     dark_pixel_fraction = float(
-        np.mean(image_gray < dark_threshold)
+        np.mean(roi_pixels < dark_threshold)
     )
 
     bright_pixel_fraction = float(
-        np.mean(image_gray > bright_threshold)
+        np.mean(roi_pixels > bright_threshold)
     )
 
     too_dark = brightness < dark_threshold
     too_bright = brightness > bright_threshold
 
+    passed = not too_dark and not too_bright
+
     return {
         "brightness": round(brightness, 2),
+        "global_brightness": round(
+            global_brightness,
+            2,
+        ),
         "dark_threshold": float(dark_threshold),
         "bright_threshold": float(bright_threshold),
-        "dark_pixel_fraction": round(dark_pixel_fraction, 4),
-        "bright_pixel_fraction": round(bright_pixel_fraction, 4),
+        "dark_pixel_fraction": round(
+            dark_pixel_fraction,
+            4,
+        ),
+        "bright_pixel_fraction": round(
+            bright_pixel_fraction,
+            4,
+        ),
+        "roi_pixel_count": int(roi_pixels.size),
         "too_dark": bool(too_dark),
         "too_bright": bool(too_bright),
-        "passed": bool(not too_dark and not too_bright),
+        "passed": bool(passed),
     }
 
 def check_glare(
@@ -1329,9 +1373,11 @@ def generate_quality_guidance(
 
     issues = []
 
-    if not roi_result["roi_complete"]:
+    # Glare is checked first because it can also damage
+    # brightness, ROI segmentation and ridge clarity.
+    if glare_result["has_glare"]:
         issues.append(
-            "Finger is too small — move it closer to the camera."
+            "Glare detected — change the light angle and retry."
         )
 
     if brightness_result["too_dark"]:
@@ -1344,9 +1390,9 @@ def generate_quality_guidance(
             "Image is too bright — reduce the lighting and retry."
         )
 
-    if glare_result["has_glare"]:
+    if not roi_result["roi_complete"]:
         issues.append(
-            "Glare detected — change the light angle and retry."
+            "Finger is too small — move it closer to the camera."
         )
 
     if blur_result["is_blurry"]:
@@ -1411,11 +1457,41 @@ def quality_gate(
         individual_checks.values()
     )
 
-    # Strict quality-gate decision:
-    # A serious individual defect cannot be hidden by a high
-    # weighted score from the other metrics.
+    raw_composite_score = float(
+        composite_result["composite_score"]
+    )
+
+    composite_threshold = float(
+        composite_result["pass_threshold"]
+    )
+
+    # When any mandatory metric fails, keep the displayed score
+    # below the acceptance threshold. The original weighted score
+    # remains available for debugging and analysis.
+    if all_individual_checks_passed:
+        composite_score = raw_composite_score
+    else:
+        hard_failure_cap = max(
+            0.0,
+            composite_threshold - 0.01,
+        )
+
+        composite_score = min(
+            raw_composite_score,
+            hard_failure_cap,
+        )
+
+    composite_score = round(
+        composite_score,
+        2,
+    )
+
+    composite_passed = (
+        composite_score >= composite_threshold
+    )
+
     passed = (
-        composite_result["passed"]
+        composite_passed
         and all_individual_checks_passed
     )
 
@@ -1432,15 +1508,10 @@ def quality_gate(
 
     return {
         "passed": bool(passed),
-        "composite_score": composite_result[
-            "composite_score"
-        ],
-        "composite_threshold": composite_result[
-            "pass_threshold"
-        ],
-        "composite_passed": composite_result[
-            "passed"
-        ],
+        "composite_score": composite_score,
+        "raw_composite_score": raw_composite_score,
+        "composite_threshold": composite_threshold,
+        "composite_passed": bool(composite_passed),
         "all_individual_checks_passed": bool(
             all_individual_checks_passed
         ),
@@ -1459,46 +1530,92 @@ def quality_gate(
     }
 
 def main() -> None:
-    """Run the complete quality gate on the good image."""
+    """Test the master quality gate on different capture conditions."""
 
-    image_path = "data/good/good_01.png"
+    test_cases = [
+        (
+            "Good",
+            "data/good/good_01.png",
+        ),
+        (
+            "Synthetic blurry",
+            "data/blurry/synthetic_blurry_01.png",
+        ),
+        (
+            "Real blurry",
+            "data/blurry/blurry_01.png",
+        ),
+        (
+            "Dark",
+            "data/dark/dark_01.png",
+        ),
+        (
+            "Glare",
+            "data/glare/glare_01.png",
+        ),
+        (
+            "Too small",
+            "data/roi/too_small_01.png",
+        ),
+    ]
 
-    result = quality_gate(image_path)
+    for label, image_path in test_cases:
+        print("\n" + "=" * 55)
+        print(f"Test case: {label}")
+        print(f"Image: {image_path}")
 
-    print(f"Image: {image_path}")
-    print(
-        f"Composite score: "
-        f"{result['composite_score']}"
-    )
-    print(
-        f"Required score: "
-        f"{result['composite_threshold']}"
-    )
-    print(
-        f"Composite passed: "
-        f"{result['composite_passed']}"
-    )
+        if not Path(image_path).exists():
+            print("Skipped: file does not exist.")
+            continue
 
-    print("\nIndividual checks")
+        try:
+            result = quality_gate(image_path)
 
-    for metric_name in METRIC_ORDER:
+        except (ValueError, IOError) as error:
+            print(f"Pipeline error: {error}")
+            continue
+
         print(
-            f"{metric_name}: "
-            f"{result['individual_checks'][metric_name]}"
+            f"Raw weighted score: "
+            f"{result['raw_composite_score']}"
         )
 
-    print(
-        f"\nAll checks passed: "
-        f"{result['all_individual_checks_passed']}"
-    )
-    print(f"Final decision: {result['passed']}")
-    print(f"Guidance: {result['guidance']}")
+        print(
+            f"Final composite score: "
+            f"{result['composite_score']}"
+        )
 
-    if result["issues"]:
-        print("\nDetected issues")
+        print(
+            f"Composite passed: "
+            f"{result['composite_passed']}"
+        )
 
-        for issue in result["issues"]:
-            print(f"- {issue}")
+        print("Individual checks:")
+
+        for metric_name in METRIC_ORDER:
+            metric_passed = result[
+                "individual_checks"
+            ][metric_name]
+
+            print(
+                f"  {metric_name}: "
+                f"{metric_passed}"
+            )
+
+        print(
+            f"Final decision: "
+            f"{result['passed']}"
+        )
+        print(
+            f"Guidance: "
+            f"{result['guidance']}"
+        )
+
+        if result["issues"]:
+            print("All detected issues:")
+
+            for issue in result["issues"]:
+                print(f"  - {issue}")
 
 
 if __name__ == "__main__":
