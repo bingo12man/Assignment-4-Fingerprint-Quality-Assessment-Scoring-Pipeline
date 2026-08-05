@@ -19,6 +19,24 @@ DEFAULT_GABOR_ORIENTATIONS = 6
 # Provisional threshold; recalibrate using the complete image dataset.
 DEFAULT_RIDGE_CLARITY_THRESHOLD = 1.5
 
+DEFAULT_QUALITY_WEIGHTS = {
+    "blur": 0.25,
+    "brightness": 0.15,
+    "glare": 0.10,
+    "roi": 0.20,
+    "ridge": 0.30,
+}
+
+METRIC_ORDER = (
+    "blur",
+    "brightness",
+    "glare",
+    "roi",
+    "ridge",
+)
+
+DEFAULT_COMPOSITE_THRESHOLD = 60.0
+
 
 def load_image(image_path: str) -> np.ndarray:
     path = Path(image_path)
@@ -1091,61 +1109,397 @@ def save_gabor_response(
 #     if not cv2.imwrite(overlay_path, overlay):
 #         raise IOError(f"Could not save ROI overlay: {overlay_path}")
 
+def clamp_01(value: float) -> float:
+
+    return max(
+        0.0,
+        min(1.0, float(value)),
+    )
+
+def normalize_higher_is_better(
+    value: float,
+    threshold: float,
+) -> float:
+
+    if threshold <= 0:
+        raise ValueError(
+            "Normalization threshold must be positive."
+        )
+
+    target_value = threshold * 2.0
+
+    normalized = value / target_value
+
+    return clamp_01(normalized)
+
+def normalize_brightness(
+    brightness: float,
+    dark_threshold: float,
+    bright_threshold: float,
+    ideal_low: float = 90.0,
+    ideal_high: float = 180.0,
+) -> float:
+
+    if not (
+        dark_threshold
+        < ideal_low
+        <= ideal_high
+        < bright_threshold
+    ):
+        raise ValueError(
+            "Brightness ranges must satisfy: "
+            "dark < ideal_low <= ideal_high < bright."
+        )
+
+    if brightness <= dark_threshold:
+        return 0.0
+
+    if brightness >= bright_threshold:
+        return 0.0
+
+    if ideal_low <= brightness <= ideal_high:
+        return 1.0
+
+    if brightness < ideal_low:
+        normalized = (
+            (brightness - dark_threshold)
+            / (ideal_low - dark_threshold)
+        )
+
+        return clamp_01(normalized)
+
+    normalized = (
+        (bright_threshold - brightness)
+        / (bright_threshold - ideal_high)
+    )
+
+    return clamp_01(normalized)
+
+def normalize_glare(
+    glare_fraction: float,
+    fraction_threshold: float,
+) -> float:
+
+    if fraction_threshold <= 0:
+        raise ValueError(
+            "Glare fraction threshold must be positive."
+        )
+
+    normalized = (
+        1.0
+        - glare_fraction / fraction_threshold
+    )
+
+    return clamp_01(normalized)
+
+def normalize_quality_metrics(
+    blur_result: dict,
+    brightness_result: dict,
+    glare_result: dict,
+    roi_result: dict,
+    ridge_result: dict,
+) -> dict:
     
+    blur_normalized = normalize_higher_is_better(
+        blur_result["blur_score"],
+        blur_result["threshold"],
+    )
+
+    brightness_normalized = normalize_brightness(
+        brightness_result["brightness"],
+        brightness_result["dark_threshold"],
+        brightness_result["bright_threshold"],
+    )
+
+    glare_normalized = normalize_glare(
+        glare_result["glare_fraction"],
+        glare_result["fraction_threshold"],
+    )
+
+    roi_normalized = normalize_higher_is_better(
+        roi_result["roi_fraction"],
+        roi_result["threshold"],
+    )
+
+    ridge_normalized = normalize_higher_is_better(
+        ridge_result["ridge_score"],
+        ridge_result["threshold"],
+    )
+
+    return {
+        "blur": round(blur_normalized, 4),
+        "brightness": round(brightness_normalized, 4),
+        "glare": round(glare_normalized, 4),
+        "roi": round(roi_normalized, 4),
+        "ridge": round(ridge_normalized, 4),
+    }
+
+def calculate_composite_score(
+    normalized_metrics: dict,
+    weights: dict | None = None,
+    pass_threshold: float = DEFAULT_COMPOSITE_THRESHOLD,
+) -> dict:
+
+    if weights is None:
+        weights = DEFAULT_QUALITY_WEIGHTS.copy()
+
+    required_metrics = set(METRIC_ORDER)
+
+    if set(normalized_metrics) != required_metrics:
+        raise ValueError(
+            "Normalized metrics must contain exactly: "
+            "blur, brightness, glare, roi and ridge."
+        )
+
+    if set(weights) != required_metrics:
+        raise ValueError(
+            "Weights must contain exactly: "
+            "blur, brightness, glare, roi and ridge."
+        )
+
+    total_weight = sum(weights.values())
+
+    if not np.isclose(total_weight, 1.0):
+        raise ValueError(
+            f"Quality weights must total 1.0, got {total_weight:.4f}."
+        )
+
+    if not 0.0 <= pass_threshold <= 100.0:
+        raise ValueError(
+            "Composite threshold must be between 0 and 100."
+        )
+
+    weighted_contributions = {}
+
+    for metric_name in METRIC_ORDER:
+        normalized_value = float(
+            normalized_metrics[metric_name]
+        )
+
+        if not 0.0 <= normalized_value <= 1.0:
+            raise ValueError(
+                f"Normalized {metric_name} score must be "
+                "between 0 and 1."
+            )
+
+        weight = float(weights[metric_name])
+
+        if weight < 0:
+            raise ValueError(
+                f"Weight for {metric_name} cannot be negative."
+            )
+
+        contribution = (
+            normalized_value
+            * weight
+            * 100.0
+        )
+
+        weighted_contributions[metric_name] = round(
+            contribution,
+            2,
+        )
+
+    composite_score = sum(
+        normalized_metrics[metric_name]
+        * weights[metric_name]
+        for metric_name in required_metrics
+    ) * 100.0
+
+    passed = composite_score >= pass_threshold
+
+    return {
+        "composite_score": round(
+            float(composite_score),
+            2,
+        ),
+        "pass_threshold": float(pass_threshold),
+        "passed": bool(passed),
+        "weights": weights,
+        "contributions": weighted_contributions,
+    }
+
+def generate_quality_guidance(
+    blur_result: dict,
+    brightness_result: dict,
+    glare_result: dict,
+    roi_result: dict,
+    ridge_result: dict,
+) -> tuple[str, list[str]]:
+
+    issues = []
+
+    if not roi_result["roi_complete"]:
+        issues.append(
+            "Finger is too small — move it closer to the camera."
+        )
+
+    if brightness_result["too_dark"]:
+        issues.append(
+            "Image is too dark — increase the lighting and retry."
+        )
+
+    if brightness_result["too_bright"]:
+        issues.append(
+            "Image is too bright — reduce the lighting and retry."
+        )
+
+    if glare_result["has_glare"]:
+        issues.append(
+            "Glare detected — change the light angle and retry."
+        )
+
+    if blur_result["is_blurry"]:
+        issues.append(
+            "Image is too blurry — hold your hand steady and retry."
+        )
+
+    if ridge_result["passed"] is False:
+        issues.append(
+            "Fingerprint ridges are unclear — adjust focus and distance."
+        )
+
+    if not issues:
+        return (
+            "Good capture — ready for processing",
+            [],
+        )
+
+    return issues[0], issues
+
+def quality_gate(
+    image_path: str,
+) -> dict:
+    
+    image_bgr = load_image(image_path)
+
+    blur_result = check_blur(image_bgr)
+    brightness_result = check_brightness(image_bgr)
+    glare_result = check_glare(image_bgr)
+    roi_result = check_roi_completeness(image_bgr)
+    ridge_result = check_ridge_clarity(image_bgr)
+
+    normalized_metrics = normalize_quality_metrics(
+        blur_result,
+        brightness_result,
+        glare_result,
+        roi_result,
+        ridge_result,
+    )
+
+    composite_result = calculate_composite_score(
+        normalized_metrics
+    )
+
+    guidance, issues = generate_quality_guidance(
+        blur_result,
+        brightness_result,
+        glare_result,
+        roi_result,
+        ridge_result,
+    )
+
+    individual_checks = {
+        "blur": not blur_result["is_blurry"],
+        "brightness": brightness_result["passed"],
+        "glare": glare_result["passed"],
+        "roi": roi_result["passed"],
+        "ridge": ridge_result["passed"],
+    }
+
+    all_individual_checks_passed = all(
+        individual_checks.values()
+    )
+
+    # Strict quality-gate decision:
+    # A serious individual defect cannot be hidden by a high
+    # weighted score from the other metrics.
+    passed = (
+        composite_result["passed"]
+        and all_individual_checks_passed
+    )
+
+    # Response maps are NumPy arrays used only for visualization.
+    # They should not be returned in the public result dictionary.
+    ridge_summary = {
+        key: value
+        for key, value in ridge_result.items()
+        if key not in {
+            "response_map",
+            "analysis_mask",
+        }
+    }
+
+    return {
+        "passed": bool(passed),
+        "composite_score": composite_result[
+            "composite_score"
+        ],
+        "composite_threshold": composite_result[
+            "pass_threshold"
+        ],
+        "composite_passed": composite_result[
+            "passed"
+        ],
+        "all_individual_checks_passed": bool(
+            all_individual_checks_passed
+        ),
+        "individual_checks": individual_checks,
+        "guidance": guidance,
+        "issues": issues,
+        "normalized_metrics": normalized_metrics,
+        "weighted_contributions": composite_result[
+            "contributions"
+        ],
+        "blur": blur_result,
+        "brightness": brightness_result,
+        "glare": glare_result,
+        "roi": roi_result,
+        "ridge": ridge_summary,
+    }
+
 def main() -> None:
-    """Compare Gabor ridge clarity using a controlled blur test."""
+    """Run the complete quality gate on the good image."""
 
-    Path("outputs").mkdir(exist_ok=True)
+    image_path = "data/good/good_01.png"
 
-    test_cases = [
-        (
-            "Good image",
-            "data/good/good_01.png",
-            "outputs/good_01_gabor_response.png",
-        ),
-        (
-            "Synthetic blurry image",
-            "data/blurry/synthetic_blurry_01.png",
-            "outputs/synthetic_blurry_01_gabor_response.png",
-        ),
-        (
-            "Real blurry image",
-            "data/blurry/blurry_01.png",
-            "outputs/blurry_01_gabor_response.png",
-        ),
-    ]
+    result = quality_gate(image_path)
 
-    for label, image_path, response_path in test_cases:
-        image_bgr = load_image(image_path)
+    print(f"Image: {image_path}")
+    print(
+        f"Composite score: "
+        f"{result['composite_score']}"
+    )
+    print(
+        f"Required score: "
+        f"{result['composite_threshold']}"
+    )
+    print(
+        f"Composite passed: "
+        f"{result['composite_passed']}"
+    )
 
-        result = check_ridge_clarity(image_bgr)
+    print("\nIndividual checks")
 
-        save_gabor_response(
-            result,
-            response_path,
-        )
-
-        print(f"\n{label}")
-        print(f"Path: {image_path}")
-        # print(
-        #     f"Processed shape: "
-        #     f"{result['processed_shape']}"
-        # )
-        # print(
-        #     f"Orientations: "
-        #     f"{result['orientation_count']}"
-        # )
-        # print(
-        #     f"Mean Gabor response: "
-        #     f"{result['mean_gabor_response']}"
-        # )
+    for metric_name in METRIC_ORDER:
         print(
-            f"Ridge clarity score: "
-            f"{result['ridge_score']}"
+            f"{metric_name}: "
+            f"{result['individual_checks'][metric_name]}"
         )
-        # print(f"Saved to: {response_path}")
-        print(f"Threshold: {result['threshold']}")
-        print(f"Passed: {result['passed']}")
+
+    print(
+        f"\nAll checks passed: "
+        f"{result['all_individual_checks_passed']}"
+    )
+    print(f"Final decision: {result['passed']}")
+    print(f"Guidance: {result['guidance']}")
+
+    if result["issues"]:
+        print("\nDetected issues")
+
+        for issue in result["issues"]:
+            print(f"- {issue}")
+
 
 if __name__ == "__main__":
     main()
