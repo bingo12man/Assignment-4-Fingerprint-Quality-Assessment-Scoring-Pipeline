@@ -2,6 +2,8 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+from time import perf_counter
+
 # Provisional value. It will be recalibrated using the complete test set.
 DEFAULT_BLUR_THRESHOLD = 8.5
 
@@ -37,6 +39,7 @@ METRIC_ORDER = (
 
 DEFAULT_COMPOSITE_THRESHOLD = 60.0
 
+DEFAULT_ANALYSIS_MAX_DIMENSION = 1024
 
 def load_image(image_path: str) -> np.ndarray:
     path = Path(image_path)
@@ -51,6 +54,44 @@ def load_image(image_path: str) -> np.ndarray:
 
     return image
 
+def resize_for_quality_analysis(
+    image_bgr: np.ndarray,
+    max_dimension: int = DEFAULT_ANALYSIS_MAX_DIMENSION,
+) -> np.ndarray:
+
+    if image_bgr.ndim != 3 or image_bgr.shape[2] != 3:
+        raise ValueError(
+            "Expected a three-channel BGR image."
+        )
+
+    if max_dimension <= 0:
+        raise ValueError(
+            "Maximum analysis dimension must be positive."
+        )
+
+    height, width = image_bgr.shape[:2]
+    largest_dimension = max(height, width)
+
+    if largest_dimension <= max_dimension:
+        return image_bgr
+
+    scale = max_dimension / largest_dimension
+
+    resized_width = max(
+        1,
+        int(round(width * scale)),
+    )
+
+    resized_height = max(
+        1,
+        int(round(height * scale)),
+    )
+
+    return cv2.resize(
+        image_bgr,
+        (resized_width, resized_height),
+        interpolation=cv2.INTER_AREA,
+    )
 
 def convert_to_grayscale(image_bgr: np.ndarray) -> np.ndarray:
 
@@ -406,12 +447,32 @@ def create_finger_mask(image_bgr: np.ndarray) -> np.ndarray:
 def check_roi_completeness(
     image_bgr: np.ndarray,
     threshold: float = DEFAULT_ROI_FRACTION_THRESHOLD,
+    finger_mask: np.ndarray | None = None,
 ) -> dict:
+    """Measure how much of the image contains the finger."""
 
-    if not 0.0 <= threshold <= 1.0:
-        raise ValueError("ROI threshold must be between 0.0 and 1.0.")
+    if image_bgr.ndim != 3 or image_bgr.shape[2] != 3:
+        raise ValueError(
+            "Expected a three-channel BGR image."
+        )
 
-    finger_mask = create_finger_mask(image_bgr)
+    if threshold <= 0.0 or threshold > 1.0:
+        raise ValueError(
+            "ROI threshold must be between 0 and 1."
+        )
+
+    if finger_mask is None:
+        finger_mask = create_finger_mask(image_bgr)
+
+    if finger_mask.ndim != 2:
+        raise ValueError(
+            "Expected a single-channel finger mask."
+        )
+
+    if finger_mask.shape != image_bgr.shape[:2]:
+        raise ValueError(
+            "Finger mask and image must have matching dimensions."
+        )
 
     roi_pixel_count = int(np.count_nonzero(finger_mask))
     total_pixel_count = int(finger_mask.size)
@@ -962,9 +1023,32 @@ def calculate_gabor_response(
 def check_ridge_clarity(
     image_bgr: np.ndarray,
     threshold: float | None = DEFAULT_RIDGE_CLARITY_THRESHOLD,
+    finger_mask: np.ndarray | None = None,
 ) -> dict:
+    """Measure fingerprint ridge clarity using Gabor filters."""
 
-    finger_mask = create_finger_mask(image_bgr)
+    if image_bgr.ndim != 3 or image_bgr.shape[2] != 3:
+        raise ValueError(
+            "Expected a three-channel BGR image."
+        )
+
+    if finger_mask is None:
+        finger_mask = create_finger_mask(image_bgr)
+
+    if finger_mask.ndim != 2:
+        raise ValueError(
+            "Expected a single-channel finger mask."
+        )
+
+    if finger_mask.shape != image_bgr.shape[:2]:
+        raise ValueError(
+            "Finger mask and image must have matching dimensions."
+        )
+
+    fingertip_patch, fingertip_mask = extract_fingertip_patch(
+        image_bgr,
+        finger_mask,
+    )
 
     fingertip_patch, fingertip_mask = extract_fingertip_patch(
         image_bgr,
@@ -1417,13 +1501,32 @@ def quality_gate(
     image_path: str,
 ) -> dict:
     
-    image_bgr = load_image(image_path)
+    original_image_bgr = load_image(image_path)
+
+    image_bgr = resize_for_quality_analysis(
+        original_image_bgr
+    )
+
+    finger_mask = create_finger_mask(image_bgr)
 
     blur_result = check_blur(image_bgr)
-    brightness_result = check_brightness(image_bgr)
+
+    brightness_result = check_brightness(
+        image_bgr,
+        finger_mask=finger_mask,
+    )
+
     glare_result = check_glare(image_bgr)
-    roi_result = check_roi_completeness(image_bgr)
-    ridge_result = check_ridge_clarity(image_bgr)
+
+    roi_result = check_roi_completeness(
+        image_bgr,
+        finger_mask=finger_mask,
+    )
+
+    ridge_result = check_ridge_clarity(
+        image_bgr,
+        finger_mask=finger_mask,
+    )
 
     normalized_metrics = normalize_quality_metrics(
         blur_result,
@@ -1527,16 +1630,187 @@ def quality_gate(
         "glare": glare_result,
         "roi": roi_result,
         "ridge": ridge_summary,
+        "original_shape": original_image_bgr.shape,
+        "analysis_shape": image_bgr.shape,
     }
 
+def benchmark_quality_gate(
+    image_path: str,
+    runs: int = 3,
+    time_budget_ms: float = 300.0,
+) -> dict:
+
+    if runs <= 0:
+        raise ValueError(
+            "Benchmark runs must be greater than zero."
+        )
+
+    if time_budget_ms <= 0:
+        raise ValueError(
+            "Time budget must be greater than zero."
+        )
+
+    # Warm-up run:
+    # OpenCV may perform one-time initialization during the
+    # first execution, so it is excluded from measurements.
+    quality_gate(image_path)
+
+    execution_times_ms = []
+
+    for _ in range(runs):
+        start_time = perf_counter()
+
+        quality_gate(image_path)
+
+        end_time = perf_counter()
+
+        elapsed_ms = (
+            end_time - start_time
+        ) * 1000.0
+
+        execution_times_ms.append(elapsed_ms)
+
+    average_time_ms = float(
+        np.mean(execution_times_ms)
+    )
+
+    minimum_time_ms = float(
+        np.min(execution_times_ms)
+    )
+
+    maximum_time_ms = float(
+        np.max(execution_times_ms)
+    )
+
+    return {
+        "runs": runs,
+        "average_time_ms": round(
+            average_time_ms,
+            2,
+        ),
+        "minimum_time_ms": round(
+            minimum_time_ms,
+            2,
+        ),
+        "maximum_time_ms": round(
+            maximum_time_ms,
+            2,
+        ),
+        "time_budget_ms": float(time_budget_ms),
+        "within_budget": bool(
+            average_time_ms < time_budget_ms
+        ),
+    }
+
+def profile_quality_stages(
+    image_path: str,
+    runs: int = 3,
+) -> dict:
+
+    if runs <= 0:
+        raise ValueError(
+            "Profile runs must be greater than zero."
+        )
+
+    stage_names = (
+        "load_image",
+        "blur",
+        "brightness",
+        "glare",
+        "roi",
+        "ridge",
+        "scoring",
+        "total",
+    )
+
+    measurements = {
+        stage_name: []
+        for stage_name in stage_names
+    }
+
+    # Warm-up execution.
+    quality_gate(image_path)
+
+    for _ in range(runs):
+        total_start = perf_counter()
+
+        stage_start = perf_counter()
+        image_bgr = load_image(image_path)
+        measurements["load_image"].append(
+            (perf_counter() - stage_start) * 1000.0
+        )
+
+        stage_start = perf_counter()
+        blur_result = check_blur(image_bgr)
+        measurements["blur"].append(
+            (perf_counter() - stage_start) * 1000.0
+        )
+
+        stage_start = perf_counter()
+        brightness_result = check_brightness(image_bgr)
+        measurements["brightness"].append(
+            (perf_counter() - stage_start) * 1000.0
+        )
+
+        stage_start = perf_counter()
+        glare_result = check_glare(image_bgr)
+        measurements["glare"].append(
+            (perf_counter() - stage_start) * 1000.0
+        )
+
+        stage_start = perf_counter()
+        roi_result = check_roi_completeness(image_bgr)
+        measurements["roi"].append(
+            (perf_counter() - stage_start) * 1000.0
+        )
+
+        stage_start = perf_counter()
+        ridge_result = check_ridge_clarity(image_bgr)
+        measurements["ridge"].append(
+            (perf_counter() - stage_start) * 1000.0
+        )
+
+        stage_start = perf_counter()
+
+        normalized_metrics = normalize_quality_metrics(
+            blur_result,
+            brightness_result,
+            glare_result,
+            roi_result,
+            ridge_result,
+        )
+
+        calculate_composite_score(
+            normalized_metrics
+        )
+
+        measurements["scoring"].append(
+            (perf_counter() - stage_start) * 1000.0
+        )
+
+        measurements["total"].append(
+            (perf_counter() - total_start) * 1000.0
+        )
+
+    average_times = {}
+
+    for stage_name in stage_names:
+        average_times[stage_name] = round(
+            float(np.mean(measurements[stage_name])),
+            2,
+        )
+
+    return {
+        "runs": runs,
+        "average_times_ms": average_times,
+    }
+
+
 def main() -> None:
-    """Test the master quality gate on different capture conditions."""
+    """Validate the optimized pipeline on all test conditions."""
 
     test_cases = [
-        (
-            "Good",
-            "data/good/good_01.png",
-        ),
+        ("Good", "data/good/good_01.png"),
         (
             "Synthetic blurry",
             "data/blurry/synthetic_blurry_01.png",
@@ -1545,14 +1819,8 @@ def main() -> None:
             "Real blurry",
             "data/blurry/blurry_01.png",
         ),
-        (
-            "Dark",
-            "data/dark/dark_01.png",
-        ),
-        (
-            "Glare",
-            "data/glare/glare_01.png",
-        ),
+        ("Dark", "data/dark/dark_01.png"),
+        ("Glare", "data/glare/glare_01.png"),
         (
             "Too small",
             "data/roi/too_small_01.png",
@@ -1576,46 +1844,32 @@ def main() -> None:
             continue
 
         print(
+            f"Original shape: "
+            f"{result['original_shape']}"
+        )
+        print(
+            f"Analysis shape: "
+            f"{result['analysis_shape']}"
+        )
+        print(
             f"Raw weighted score: "
             f"{result['raw_composite_score']}"
         )
-
         print(
             f"Final composite score: "
             f"{result['composite_score']}"
         )
 
-        print(
-            f"Composite passed: "
-            f"{result['composite_passed']}"
-        )
-
         print("Individual checks:")
 
         for metric_name in METRIC_ORDER:
-            metric_passed = result[
-                "individual_checks"
-            ][metric_name]
-
             print(
                 f"  {metric_name}: "
-                f"{metric_passed}"
+                f"{result['individual_checks'][metric_name]}"
             )
 
-        print(
-            f"Final decision: "
-            f"{result['passed']}"
-        )
-        print(
-            f"Guidance: "
-            f"{result['guidance']}"
-        )
-
-        if result["issues"]:
-            print("All detected issues:")
-
-            for issue in result["issues"]:
-                print(f"  - {issue}")
+        print(f"Final decision: {result['passed']}")
+        print(f"Guidance: {result['guidance']}")
 
 
 if __name__ == "__main__":
